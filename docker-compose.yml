@@ -1,0 +1,66 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      APP_ENV: development
+      APP_PORT: "8080"
+      DATABASE_URL: postgres://market:market_dev_password@postgres:5432/marketplace?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      JWT_SECRET: ${JWT_SECRET:-local-marketplace-development-secret-change-me}
+      UPLOAD_DIR: /app/uploads
+    ports:
+      - "8080:8080"
+    volumes:
+      - product_images:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      VITE_API_PROXY_TARGET: http://backend:8080
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: market
+      POSTGRES_PASSWORD: market_dev_password
+      POSTGRES_DB: marketplace
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U market -d marketplace"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  product_images:
