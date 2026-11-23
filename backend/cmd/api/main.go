@@ -47,6 +47,11 @@ func main() {
 		log.Fatalf("initialize catalog schema: %v", err)
 	}
 	catalog.RegisterRoutes(router.Group("/api/v1"), auth)
+	orders := httptransport.NewOrders(db)
+	if err := orders.EnsureSchema(); err != nil {
+		log.Fatalf("initialize order schema: %v", err)
+	}
+	orders.RegisterRoutes(router.Group("/api/v1"), auth)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,

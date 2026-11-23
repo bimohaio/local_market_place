@@ -110,3 +110,22 @@ Admin routes require an admin Bearer access token:
 The frontend lists/searches/filters/paginates active products. Admin users see the management
 panel in the top navigation, where they can create, edit and delete categories and products, upload
 images, and hide or publish products. Catalog tables are created idempotently when the API starts.
+
+## Cart, checkout and orders
+
+- `GET /api/v1/cart`; `POST /api/v1/cart/items` with `{ "product_id": 1, "quantity": 1 }`;
+  `PUT /api/v1/cart/items/:product_id` with `{ "quantity": 2 }`; `DELETE /api/v1/cart/items/:product_id`.
+- `POST /api/v1/checkout` requires an `Idempotency-Key` header and recipient name, phone, delivery
+  address, optional note, and `payment_method: "cod"`. Checkout recalculates prices on the server,
+  locks product rows, creates order snapshots and payment/inventory records, decrements stock and
+  clears the cart in a PostgreSQL transaction. Repeated requests with the same user/key return the
+  original order.
+- `GET /api/v1/orders` and `GET /api/v1/orders/:id` show a user's own paginated order history;
+  `POST /api/v1/orders/:id/cancel` cancels a confirmed order and restores stock atomically.
+- Admins can search/filter/paginate `GET /api/v1/admin/orders`, inspect a specific order, and advance
+  its status using `PATCH /api/v1/admin/orders/:id/status` with `{ "status": "processing" }`.
+  Allowed transitions are confirmed → processing → shipped → delivered; cancellation is allowed
+  before shipment. Every transition is recorded in `order_status_history`.
+- COD is the only checkout method configured. Payment rows and statuses are recorded; COD is marked
+  paid when an admin marks the order delivered. Online providers need merchant credentials and
+  verified provider webhooks before they can be enabled.

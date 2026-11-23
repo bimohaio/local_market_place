@@ -46,7 +46,49 @@ type Product = {
 
 type ProductPage = { data: Product[]; page: number; limit: number; total: number }
 
+type CartLine = {
+  product_id: number
+  name: string
+  slug: string
+  image_url: string
+  price: number
+  stock: number
+  quantity: number
+  line_total: number
+}
+
+type Cart = { items: CartLine[]; total: number; item_count: number }
+type OrderStatus = 'confirmed' | 'processing' | 'shipped' | 'delivered' | 'cancelled'
+type OrderLine = { id: number; product_id: number; product_name: string; product_slug: string; image_url: string; unit_price: number; quantity: number; line_total: number }
+type Order = {
+  id: number
+  code: string
+  user_id: number
+  email: string
+  recipient_name: string
+  phone: string
+  address: string
+  note: string
+  payment_method: string
+  payment_status: string
+  status: OrderStatus
+  subtotal: number
+  shipping_fee: number
+  total: number
+  items?: OrderLine[]
+  status_history?: { from_status?: string; to_status: OrderStatus; changed_by?: number; created_at: string }[]
+  created_at: string
+}
+type OrderPage = { data: Order[]; page: number; limit: number; total: number }
+
 const SESSION_KEY = 'localmarket.auth'
+const emptyCart: Cart = { items: [], total: 0, item_count: 0 }
+
+function formatMoney(value: number) { return `${value.toLocaleString('vi-VN')}đ` }
+
+function orderStatusLabel(status: OrderStatus) {
+  return ({ confirmed: 'Đã xác nhận', processing: 'Đang chuẩn bị', shipped: 'Đang giao', delivered: 'Đã giao', cancelled: 'Đã hủy' })[status]
+}
 
 function saveSession(session: Session | null) {
   if (session) sessionStorage.setItem(SESSION_KEY, JSON.stringify(session))
@@ -72,6 +114,7 @@ export default function App() {
   const [authError, setAuthError] = useState('')
   const [notice, setNotice] = useState('')
   const sessionRef = useRef<Session | null>(null)
+  const checkoutKeyRef = useRef('')
   const [categoriesData, setCategoriesData] = useState<Category[]>([])
   const [productsData, setProductsData] = useState<ProductPage>({ data: [], page: 1, limit: 8, total: 0 })
   const [searchInput, setSearchInput] = useState('')
@@ -92,6 +135,24 @@ export default function App() {
   const [uploadedImage, setUploadedImage] = useState('')
   const [imagePreview, setImagePreview] = useState('')
   const [imageBusy, setImageBusy] = useState(false)
+  const [cart, setCart] = useState<Cart>(emptyCart)
+  const [cartOpen, setCartOpen] = useState(false)
+  const [checkoutOpen, setCheckoutOpen] = useState(false)
+  const [checkoutBusy, setCheckoutBusy] = useState(false)
+  const [checkoutError, setCheckoutError] = useState('')
+  const [ordersOpen, setOrdersOpen] = useState(false)
+  const [orderPage, setOrderPage] = useState<OrderPage>({ data: [], page: 1, limit: 8, total: 0 })
+  const [orderPageNumber, setOrderPageNumber] = useState(1)
+  const [orderReload, setOrderReload] = useState(0)
+  const [orderError, setOrderError] = useState('')
+  const [selectedOrder, setSelectedOrder] = useState<Order | null>(null)
+  const [selectedOrderAdmin, setSelectedOrderAdmin] = useState(false)
+  const [adminOrderPage, setAdminOrderPage] = useState<OrderPage>({ data: [], page: 1, limit: 8, total: 0 })
+  const [adminOrderPageNumber, setAdminOrderPageNumber] = useState(1)
+  const [adminOrderStatus, setAdminOrderStatus] = useState('')
+  const [adminOrderSearch, setAdminOrderSearch] = useState('')
+  const [adminOrderSearchInput, setAdminOrderSearchInput] = useState('')
+  const [adminOrderReload, setAdminOrderReload] = useState(0)
 
   useEffect(() => { sessionRef.current = session }, [session])
 
@@ -209,6 +270,45 @@ export default function App() {
       .then(setAdminProducts)
       .catch((error) => setAdminError(error instanceof Error ? error.message : 'Không tải được dữ liệu quản trị.'))
   }, [adminOpen, adminPage, adminReload, searchQuery, session?.user.role])
+
+  useEffect(() => {
+    if (!session) {
+      setCart(emptyCart)
+      return
+    }
+    authorizedFetch('/api/v1/cart')
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await readError(response))
+        return response.json() as Promise<Cart>
+      })
+      .then(setCart)
+      .catch(() => setCart(emptyCart))
+  }, [session?.user.id])
+
+  useEffect(() => {
+    if (!ordersOpen || !session) return
+    const params = new URLSearchParams({ page: String(orderPageNumber), limit: '8' })
+    authorizedFetch(`/api/v1/orders?${params.toString()}`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await readError(response))
+        return response.json() as Promise<OrderPage>
+      })
+      .then(setOrderPage)
+      .catch((error) => setOrderError(error instanceof Error ? error.message : 'Không tải được đơn hàng.'))
+  }, [ordersOpen, orderPageNumber, orderReload, session?.user.id])
+
+  useEffect(() => {
+    if (!adminOpen || session?.user.role !== 'admin') return
+    const params = new URLSearchParams({ page: String(adminOrderPageNumber), limit: '8', q: adminOrderSearch })
+    if (adminOrderStatus) params.set('status', adminOrderStatus)
+    authorizedFetch(`/api/v1/admin/orders?${params.toString()}`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await readError(response))
+        return response.json() as Promise<OrderPage>
+      })
+      .then(setAdminOrderPage)
+      .catch((error) => setOrderError(error instanceof Error ? error.message : 'Không tải được đơn hàng.'))
+  }, [adminOpen, adminOrderPageNumber, adminOrderReload, adminOrderSearch, adminOrderStatus, session?.user.role])
 
   async function submitAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -393,6 +493,133 @@ export default function App() {
     }
   }
 
+  async function addCartItem(product: Product) {
+    if (!sessionRef.current) {
+      openAuth('login')
+      return
+    }
+    try {
+      const response = await authorizedFetch('/api/v1/cart/items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ product_id: product.id, quantity: 1 }),
+      })
+      if (!response.ok) throw new Error(await readError(response))
+      setCart(await response.json() as Cart)
+      setNotice(`Đã thêm “${product.name}” vào giỏ.`)
+      window.setTimeout(() => setNotice(''), 3500)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Không thể thêm sản phẩm vào giỏ.')
+      window.setTimeout(() => setNotice(''), 4000)
+    }
+  }
+
+  async function updateCartItem(productID: number, quantity: number) {
+    try {
+      const response = await authorizedFetch(`/api/v1/cart/items/${productID}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quantity }),
+      })
+      if (!response.ok) throw new Error(await readError(response))
+      setCart(await response.json() as Cart)
+    } catch (error) {
+      setCheckoutError(error instanceof Error ? error.message : 'Không thể cập nhật giỏ hàng.')
+    }
+  }
+
+  async function removeCartItem(productID: number) {
+    try {
+      const response = await authorizedFetch(`/api/v1/cart/items/${productID}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(await readError(response))
+      setCart(await response.json() as Cart)
+      setCheckoutError('')
+    } catch (error) {
+      setCheckoutError(error instanceof Error ? error.message : 'Không thể xóa sản phẩm khỏi giỏ.')
+    }
+  }
+
+  async function submitCheckout(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setCheckoutBusy(true)
+    setCheckoutError('')
+    const values = new FormData(event.currentTarget)
+    try {
+      const response = await authorizedFetch('/api/v1/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': checkoutKeyRef.current || (checkoutKeyRef.current = crypto.randomUUID()) },
+        body: JSON.stringify({
+          recipient_name: String(values.get('recipient_name') ?? '').trim(),
+          phone: String(values.get('phone') ?? '').trim(),
+          address: String(values.get('address') ?? '').trim(),
+          note: String(values.get('note') ?? '').trim(),
+          payment_method: 'cod',
+        }),
+      })
+      if (!response.ok) throw new Error(await readError(response))
+      const result = (await response.json()) as { data: Order }
+      checkoutKeyRef.current = ''
+      setCart(emptyCart)
+      setCheckoutOpen(false)
+      setCartOpen(false)
+      setSelectedOrder(result.data)
+      setSelectedOrderAdmin(false)
+      setOrderReload((value) => value + 1)
+      setNotice(`Đặt hàng thành công · ${result.data.code}`)
+      window.setTimeout(() => setNotice(''), 5000)
+    } catch (error) {
+      setCheckoutError(error instanceof Error ? error.message : 'Không thể hoàn tất đơn hàng.')
+    } finally {
+      setCheckoutBusy(false)
+    }
+  }
+
+  async function openOrderDetails(order: Order, admin = false) {
+    setOrdersOpen(false)
+    setSelectedOrder(order)
+    setSelectedOrderAdmin(admin)
+    try {
+      const response = await authorizedFetch(`/api/v1/${admin ? 'admin/' : ''}orders/${order.id}`)
+      if (!response.ok) throw new Error(await readError(response))
+      const result = (await response.json()) as { data: Order }
+      setSelectedOrder(result.data)
+    } catch (error) {
+      setOrderError(error instanceof Error ? error.message : 'Không tải được chi tiết đơn hàng.')
+    }
+  }
+
+  async function cancelOrder(order: Order) {
+    if (!window.confirm(`Hủy đơn ${order.code}? Tồn kho sẽ được hoàn lại.`)) return
+    try {
+      const response = await authorizedFetch(`/api/v1/orders/${order.id}/cancel`, { method: 'POST' })
+      if (!response.ok) throw new Error(await readError(response))
+      const result = (await response.json()) as { data: Order }
+      setSelectedOrder(result.data)
+      setOrderReload((value) => value + 1)
+      setNotice('Đơn hàng đã được hủy.')
+      window.setTimeout(() => setNotice(''), 4000)
+    } catch (error) {
+      setOrderError(error instanceof Error ? error.message : 'Không thể hủy đơn hàng.')
+    }
+  }
+
+  async function advanceOrder(order: Order, status: OrderStatus) {
+    try {
+      const response = await authorizedFetch(`/api/v1/admin/orders/${order.id}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      })
+      if (!response.ok) throw new Error(await readError(response))
+      const result = (await response.json()) as { data: Order }
+      setAdminOrderReload((value) => value + 1)
+      if (selectedOrder?.id === order.id) setSelectedOrder(result.data)
+      setOrderError('')
+    } catch (error) {
+      setOrderError(error instanceof Error ? error.message : 'Không thể cập nhật trạng thái đơn.')
+    }
+  }
+
   return (
     <main>
       <header className="topbar">
@@ -402,6 +629,7 @@ export default function App() {
           {session ? (
             <>
               <span className="account-name">{session.user.name}<small className={`role-badge ${session.user.role}`}>{session.user.role === 'admin' ? 'Admin' : 'User'}</small></span>
+              <button className="auth-outline-button" type="button" onClick={() => { setOrdersOpen(true); setOrderError('') }}>Đơn hàng</button>
               {session.user.role === 'admin' && <button className="auth-outline-button" type="button" onClick={() => { setAdminOpen((open) => !open); setAdminError('') }}>{adminOpen ? 'Đóng quản trị' : 'Quản trị'}</button>}
               <button className="auth-outline-button" type="button" onClick={logout}>Đăng xuất</button>
             </>
@@ -411,7 +639,7 @@ export default function App() {
               <button className="auth-primary-button" type="button" onClick={() => openAuth('register')}>Đăng ký</button>
             </>
           )}
-          <button className="cart-button" type="button" onClick={() => alert('Giỏ hàng sẽ được triển khai ở bước tiếp theo.')}>Giỏ hàng <span>0</span></button>
+          <button className="cart-button" type="button" onClick={() => { if (!session) openAuth('login'); else { setCartOpen(true); setCheckoutError('') } }}>Giỏ hàng <span>{cart.item_count}</span></button>
         </div>
       </header>
 
@@ -441,6 +669,18 @@ export default function App() {
             {adminProducts.data.map((product) => <tr key={product.id}><td><div className="admin-product-name">{product.image_url ? <img src={product.image_url} alt="" /> : <span>🧺</span>}<strong>{product.name}</strong></div></td><td>{product.category}</td><td>{product.price.toLocaleString('vi-VN')}đ</td><td>{product.stock}</td><td><span className={`product-status ${product.is_active ? 'active' : 'inactive'}`}>{product.is_active ? 'Đang bán' : 'Ẩn'}</span></td><td><div className="admin-row-actions"><button type="button" onClick={() => { setProductEditor(product); setUploadedImage(product.image_url); setImagePreview(product.image_url); setAdminError('') }}>Sửa</button><button className="danger-button" type="button" onClick={() => deleteProduct(product)}>Xóa</button></div></td></tr>)}
           </tbody></table></div> : <p className="admin-hint">Chưa có sản phẩm phù hợp.</p>}
           <div className="pagination admin-pagination"><button type="button" disabled={adminPage <= 1} onClick={() => setAdminPage((value) => value - 1)}>← Trước</button><span>Trang {adminPage} / {Math.max(1, Math.ceil(adminProducts.total / 8))}</span><button type="button" disabled={adminPage >= Math.ceil(adminProducts.total / 8)} onClick={() => setAdminPage((value) => value + 1)}>Sau →</button></div>
+
+          <div className="admin-section-heading product-admin-heading"><div><h3>Đơn hàng</h3><span>{adminOrderPage.total} đơn</span></div></div>
+          <form className="catalog-toolbar order-toolbar" onSubmit={(event) => { event.preventDefault(); setAdminOrderPageNumber(1); setAdminOrderSearch(adminOrderSearchInput.trim()) }}>
+            <label className="catalog-search"><span>⌕</span><input value={adminOrderSearchInput} onChange={(event) => setAdminOrderSearchInput(event.target.value)} placeholder="Tìm mã đơn, email, người nhận..." aria-label="Tìm đơn hàng" /></label>
+            <select value={adminOrderStatus} onChange={(event) => { setAdminOrderStatus(event.target.value); setAdminOrderPageNumber(1) }} aria-label="Lọc trạng thái"><option value="">Tất cả trạng thái</option><option value="confirmed">Đã xác nhận</option><option value="processing">Đang chuẩn bị</option><option value="shipped">Đang giao</option><option value="delivered">Đã giao</option><option value="cancelled">Đã hủy</option></select>
+            <button className="catalog-search-button" type="submit">Tìm đơn</button>
+          </form>
+          {orderError && <p className="admin-error" role="alert">{orderError}</p>}
+          {adminOrderPage.data.length ? <div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Mã đơn</th><th>Người nhận</th><th>Ngày đặt</th><th>Tổng tiền</th><th>Trạng thái</th><th>Thao tác</th></tr></thead><tbody>
+            {adminOrderPage.data.map((order) => <tr key={order.id}><td><button className="table-link" type="button" onClick={() => openOrderDetails(order, true)}>{order.code}</button></td><td>{order.recipient_name}<small className="table-subtext">{order.phone}</small></td><td>{new Date(order.created_at).toLocaleDateString('vi-VN')}</td><td>{formatMoney(order.total)}</td><td><span className={`product-status ${order.status === 'cancelled' ? 'inactive' : 'active'}`}>{orderStatusLabel(order.status)}</span></td><td><div className="admin-row-actions">{order.status === 'confirmed' && <><button type="button" onClick={() => advanceOrder(order, 'processing')}>Chuẩn bị</button><button className="danger-button" type="button" onClick={() => advanceOrder(order, 'cancelled')}>Hủy</button></>}{order.status === 'processing' && <><button type="button" onClick={() => advanceOrder(order, 'shipped')}>Gửi hàng</button><button className="danger-button" type="button" onClick={() => advanceOrder(order, 'cancelled')}>Hủy</button></>}{order.status === 'shipped' && <button type="button" onClick={() => advanceOrder(order, 'delivered')}>Đã giao</button>}</div></td></tr>)}
+          </tbody></table></div> : <p className="admin-hint">Chưa có đơn hàng phù hợp.</p>}
+          <div className="pagination admin-pagination"><button type="button" disabled={adminOrderPageNumber <= 1} onClick={() => setAdminOrderPageNumber((value) => value - 1)}>← Trước</button><span>Trang {adminOrderPageNumber} / {Math.max(1, Math.ceil(adminOrderPage.total / 8))}</span><button type="button" disabled={adminOrderPageNumber >= Math.ceil(adminOrderPage.total / 8)} onClick={() => setAdminOrderPageNumber((value) => value + 1)}>Sau →</button></div>
         </section>
       )}
 
@@ -464,7 +704,7 @@ export default function App() {
         {productsLoading ? <p className="empty-catalog">Đang tải sản phẩm...</p> : productsData.data.length ? <div className="product-grid">
           {productsData.data.map((product) => <article className="product-card" key={product.id}>
             <div className="product-art">{product.image_url ? <img src={product.image_url} alt={product.name} /> : <span>🧺</span>}<small>{product.category}</small></div>
-            <div className="product-info"><p>{product.category}</p><h3>{product.name}</h3><p className="product-description">{product.description}</p><div className="product-bottom"><strong>{product.price.toLocaleString('vi-VN')}đ</strong><span className="stock-label">Còn {product.stock}</span></div></div>
+            <div className="product-info"><p>{product.category}</p><h3>{product.name}</h3><p className="product-description">{product.description}</p><div className="product-bottom"><strong>{formatMoney(product.price)}</strong><button className="cart-add-button" type="button" disabled={product.stock < 1} onClick={() => addCartItem(product)}>{product.stock < 1 ? 'Hết hàng' : 'Thêm vào giỏ'}</button></div></div>
           </article>)}
         </div> : <p className="empty-catalog">{searchQuery || categoryFilter ? 'Không tìm thấy sản phẩm phù hợp.' : 'Chưa có sản phẩm nào. Quay lại sau nhé!'}</p>}
         <div className="pagination"><button type="button" disabled={productPage <= 1} onClick={() => setProductPage((value) => value - 1)}>← Trước</button><span>Trang {productPage} / {Math.max(1, Math.ceil(productsData.total / 8))}</span><button type="button" disabled={productPage >= Math.ceil(productsData.total / 8)} onClick={() => setProductPage((value) => value + 1)}>Sau →</button></div>
@@ -478,6 +718,74 @@ export default function App() {
         <span className={health && !healthError ? 'status-dot online' : 'status-dot'} />
         {healthError ? 'Không kết nối được API' : health ? `API hoạt động · PostgreSQL ${health.dependencies.postgres} · Redis ${health.dependencies.redis}` : 'Đang kiểm tra kết nối...'}
       </div>
+
+      {cartOpen && session && (
+        <div className="auth-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCartOpen(false) }}>
+          <section className="auth-dialog shopping-dialog" role="dialog" aria-modal="true" aria-labelledby="cart-title">
+            <button className="auth-close" type="button" aria-label="Đóng giỏ hàng" onClick={() => setCartOpen(false)}>×</button>
+            <p className="eyebrow">GIỎ HÀNG CỦA BẠN</p><h2 id="cart-title">Giỏ hàng <span className="cart-count-label">{cart.item_count} sản phẩm</span></h2>
+            {cart.items.length ? <div className="cart-line-list">{cart.items.map((item) => <div className="cart-line" key={item.product_id}>
+              {item.image_url ? <img src={item.image_url} alt="" /> : <span className="cart-line-placeholder">🧺</span>}
+              <div className="cart-line-info"><strong>{item.name}</strong><span>{formatMoney(item.price)}</span><small>Còn {item.stock} trong kho</small></div>
+              <div className="quantity-control"><button type="button" aria-label="Giảm số lượng" disabled={item.quantity <= 1} onClick={() => updateCartItem(item.product_id, item.quantity - 1)}>−</button><span>{item.quantity}</span><button type="button" aria-label="Tăng số lượng" disabled={item.quantity >= item.stock} onClick={() => updateCartItem(item.product_id, item.quantity + 1)}>+</button></div>
+              <button className="remove-line" type="button" onClick={() => removeCartItem(item.product_id)}>Xóa</button>
+            </div>)}</div> : <p className="empty-catalog cart-empty">Giỏ hàng đang trống. Hãy chọn vài sản phẩm bạn thích nhé.</p>}
+            {checkoutError && <p className="auth-error" role="alert">{checkoutError}</p>}
+            <div className="cart-total-row"><span>Tạm tính</span><strong>{formatMoney(cart.total)}</strong></div>
+            <button className="auth-submit" type="button" disabled={!cart.items.length} onClick={() => { setCartOpen(false); setCheckoutOpen(true); setCheckoutError('') }}>Tiến hành đặt hàng</button>
+          </section>
+        </div>
+      )}
+
+      {checkoutOpen && session && (
+        <div className="auth-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCheckoutOpen(false) }}>
+          <section className="auth-dialog shopping-dialog" role="dialog" aria-modal="true" aria-labelledby="checkout-title">
+            <button className="auth-close" type="button" aria-label="Đóng thanh toán" onClick={() => setCheckoutOpen(false)}>×</button>
+            <p className="eyebrow">HOÀN TẤT ĐƠN HÀNG</p><h2 id="checkout-title">Thông tin giao hàng</h2>
+            <p className="auth-subtitle">Đơn hàng có {cart.item_count} sản phẩm · Tổng {formatMoney(cart.total)}</p>
+            <form className="auth-form admin-form" onSubmit={submitCheckout}>
+              <label>Người nhận<input name="recipient_name" autoComplete="name" defaultValue={session.user.name} maxLength={120} required /></label>
+              <label>Số điện thoại<input name="phone" type="tel" autoComplete="tel" maxLength={40} required /></label>
+              <label>Địa chỉ giao hàng<textarea name="address" autoComplete="street-address" rows={3} maxLength={1000} required /></label>
+              <label>Ghi chú<textarea name="note" rows={2} maxLength={1000} placeholder="Không bắt buộc" /></label>
+              <div className="payment-method-note"><span>💵</span><div><strong>Thanh toán khi nhận hàng (COD)</strong><small>Thanh toán cho đơn vị giao hàng khi nhận sản phẩm.</small></div></div>
+              {checkoutError && <p className="auth-error" role="alert">{checkoutError}</p>}
+              <button className="auth-submit" type="submit" disabled={checkoutBusy || !cart.items.length}>{checkoutBusy ? 'Đang tạo đơn...' : `Đặt hàng · ${formatMoney(cart.total)}`}</button>
+            </form>
+          </section>
+        </div>
+      )}
+
+      {ordersOpen && session && (
+        <div className="auth-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setOrdersOpen(false) }}>
+          <section className="auth-dialog orders-dialog" role="dialog" aria-modal="true" aria-labelledby="orders-title">
+            <button className="auth-close" type="button" aria-label="Đóng đơn hàng" onClick={() => setOrdersOpen(false)}>×</button>
+            <p className="eyebrow">LỊCH SỬ MUA HÀNG</p><h2 id="orders-title">Đơn hàng của tôi</h2>
+            {orderError && <p className="auth-error" role="alert">{orderError}</p>}
+            {orderPage.data.length ? <div className="order-card-list">{orderPage.data.map((order) => <button className="order-card" type="button" key={order.id} onClick={() => openOrderDetails(order)}>
+              <span className="order-card-top"><strong>{order.code}</strong><small className={`product-status ${order.status === 'cancelled' ? 'inactive' : 'active'}`}>{orderStatusLabel(order.status)}</small></span>
+              <span className="order-card-bottom"><small>{new Date(order.created_at).toLocaleString('vi-VN')}</small><strong>{formatMoney(order.total)}</strong></span>
+            </button>)}</div> : <p className="empty-catalog">Bạn chưa có đơn hàng nào.</p>}
+            <div className="pagination"><button type="button" disabled={orderPageNumber <= 1} onClick={() => setOrderPageNumber((value) => value - 1)}>← Trước</button><span>Trang {orderPageNumber} / {Math.max(1, Math.ceil(orderPage.total / 8))}</span><button type="button" disabled={orderPageNumber >= Math.ceil(orderPage.total / 8)} onClick={() => setOrderPageNumber((value) => value + 1)}>Sau →</button></div>
+          </section>
+        </div>
+      )}
+
+      {selectedOrder && (
+        <div className="auth-overlay order-detail-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedOrder(null) }}>
+          <section className="auth-dialog orders-dialog" role="dialog" aria-modal="true" aria-labelledby="order-detail-title">
+            <button className="auth-close" type="button" aria-label="Đóng chi tiết đơn" onClick={() => setSelectedOrder(null)}>×</button>
+            <p className="eyebrow">CHI TIẾT ĐƠN HÀNG</p><h2 id="order-detail-title">{selectedOrder.code}</h2>
+            <div className="order-detail-meta"><span className={`product-status ${selectedOrder.status === 'cancelled' ? 'inactive' : 'active'}`}>{orderStatusLabel(selectedOrder.status)}</span><small>{new Date(selectedOrder.created_at).toLocaleString('vi-VN')}</small></div>
+            <div className="order-address"><strong>{selectedOrder.recipient_name} · {selectedOrder.phone}</strong><span>{selectedOrder.address}</span><small>Thanh toán COD · {selectedOrder.payment_status === 'paid' ? 'Đã thanh toán' : selectedOrder.payment_status === 'cancelled' ? 'Đã hủy' : 'Chưa thanh toán'}</small></div>
+            <div className="order-item-list">{selectedOrder.items?.map((item) => <div className="order-item" key={item.id}>{item.image_url ? <img src={item.image_url} alt="" /> : <span className="cart-line-placeholder">🧺</span>}<span>{item.product_name} <small>× {item.quantity}</small></span><strong>{formatMoney(item.line_total)}</strong></div>)}</div>
+            <div className="cart-total-row"><span>Tổng cộng</span><strong>{formatMoney(selectedOrder.total)}</strong></div>
+            {selectedOrder.status_history?.length ? <div className="order-timeline"><strong>Lịch sử trạng thái</strong>{selectedOrder.status_history.map((change, index) => <div key={`${change.created_at}-${index}`}><span className="timeline-dot" /><span>{orderStatusLabel(change.to_status)}<small>{new Date(change.created_at).toLocaleString('vi-VN')}</small></span></div>)}</div> : null}
+            {orderError && <p className="auth-error" role="alert">{orderError}</p>}
+            {!selectedOrderAdmin && selectedOrder.status === 'confirmed' && <button className="danger-wide-button" type="button" onClick={() => cancelOrder(selectedOrder)}>Hủy đơn hàng</button>}
+          </section>
+        </div>
+      )}
 
       {notice && <div className="auth-toast" role="status">{notice}</div>}
 

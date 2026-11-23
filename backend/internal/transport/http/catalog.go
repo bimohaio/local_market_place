@@ -476,7 +476,7 @@ func (catalog *Catalog) deleteProduct(c *gin.Context) {
 	}
 	result, err := catalog.db.ExecContext(c.Request.Context(), `DELETE FROM products WHERE id = $1`, id)
 	if err != nil {
-		internalError(c)
+		writeCatalogDBError(c, err, "Không thể xóa sản phẩm đã được đặt hàng")
 		return
 	}
 	if count, _ := result.RowsAffected(); count == 0 {

@@ -256,6 +256,8 @@ func (a *Auth) RequireAuth() gin.HandlerFunc {
 			return
 		}
 		c.Set("auth_user", gin.H{"id": claims.UserID, "email": claims.Email, "role": claims.Role})
+		c.Set("auth_user_id", claims.UserID)
+		c.Set("auth_email", claims.Email)
 		c.Set("auth_role", claims.Role)
 		c.Next()
 	}
