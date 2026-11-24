@@ -116,10 +116,12 @@ images, and hide or publish products. Catalog tables are created idempotently wh
 - `GET /api/v1/cart`; `POST /api/v1/cart/items` with `{ "product_id": 1, "quantity": 1 }`;
   `PUT /api/v1/cart/items/:product_id` with `{ "quantity": 2 }`; `DELETE /api/v1/cart/items/:product_id`.
 - `POST /api/v1/checkout` requires an `Idempotency-Key` header and recipient name, phone, delivery
-  address, optional note, and `payment_method: "cod"`. Checkout recalculates prices on the server,
-  locks product rows, creates order snapshots and payment/inventory records, decrements stock and
-  clears the cart in a PostgreSQL transaction. Repeated requests with the same user/key return the
-  original order.
+  address, optional note, and `payment_method: "cod"`. Adding/updating a cart item reserves available
+  stock immediately for 30 minutes; removing the item or letting the reservation expire releases it.
+  A cleanup task releases expired reservations. Checkout recalculates prices on the server, locks
+  product rows, creates order snapshots and payment/inventory records, converts the reservation into
+  a physical stock deduction and clears the cart in one PostgreSQL transaction. Repeated requests
+  with the same user/key return the original order.
 - `GET /api/v1/orders` and `GET /api/v1/orders/:id` show a user's own paginated order history;
   `POST /api/v1/orders/:id/cancel` cancels a confirmed order and restores stock atomically.
 - Admins can search/filter/paginate `GET /api/v1/admin/orders`, inspect a specific order, and advance

@@ -40,6 +40,8 @@ type Product = {
   description: string
   price: number
   stock: number
+  reserved_stock: number
+  available_stock: number
   image_url: string
   is_active: boolean
 }
@@ -122,6 +124,7 @@ export default function App() {
   const [categoryFilter, setCategoryFilter] = useState('')
   const [sortBy, setSortBy] = useState('created_at')
   const [productPage, setProductPage] = useState(1)
+  const [stockRefresh, setStockRefresh] = useState(0)
   const [productsLoading, setProductsLoading] = useState(true)
   const [catalogError, setCatalogError] = useState('')
   const [adminOpen, setAdminOpen] = useState(false)
@@ -257,7 +260,7 @@ export default function App() {
       .then(setProductsData)
       .catch((error) => setCatalogError(error instanceof Error ? error.message : 'Không tải được sản phẩm.'))
       .finally(() => setProductsLoading(false))
-  }, [productPage, searchQuery, categoryFilter, sortBy])
+  }, [productPage, searchQuery, categoryFilter, sortBy, stockRefresh])
 
   useEffect(() => {
     if (!adminOpen || session?.user.role !== 'admin') return
@@ -281,7 +284,7 @@ export default function App() {
         if (!response.ok) throw new Error(await readError(response))
         return response.json() as Promise<Cart>
       })
-      .then(setCart)
+      .then((nextCart) => { setCart(nextCart); setStockRefresh((value) => value + 1) })
       .catch(() => setCart(emptyCart))
   }, [session?.user.id])
 
@@ -505,10 +508,11 @@ export default function App() {
         body: JSON.stringify({ product_id: product.id, quantity: 1 }),
       })
       if (!response.ok) throw new Error(await readError(response))
-      setCart(await response.json() as Cart)
+      applyCartSnapshot(await response.json() as Cart)
       setNotice(`Đã thêm “${product.name}” vào giỏ.`)
       window.setTimeout(() => setNotice(''), 3500)
     } catch (error) {
+      setStockRefresh((value) => value + 1)
       setNotice(error instanceof Error ? error.message : 'Không thể thêm sản phẩm vào giỏ.')
       window.setTimeout(() => setNotice(''), 4000)
     }
@@ -522,8 +526,9 @@ export default function App() {
         body: JSON.stringify({ quantity }),
       })
       if (!response.ok) throw new Error(await readError(response))
-      setCart(await response.json() as Cart)
+      applyCartSnapshot(await response.json() as Cart)
     } catch (error) {
+      setStockRefresh((value) => value + 1)
       setCheckoutError(error instanceof Error ? error.message : 'Không thể cập nhật giỏ hàng.')
     }
   }
@@ -531,8 +536,16 @@ export default function App() {
   async function removeCartItem(productID: number) {
     try {
       const response = await authorizedFetch(`/api/v1/cart/items/${productID}`, { method: 'DELETE' })
-      if (!response.ok) throw new Error(await readError(response))
+      if (!response.ok) {
+        const message = await readError(response)
+        if (response.status === 409) {
+          const currentCart = await authorizedFetch('/api/v1/cart')
+          if (currentCart.ok) applyCartSnapshot(await currentCart.json() as Cart)
+        }
+        throw new Error(message)
+      }
       setCart(await response.json() as Cart)
+      setStockRefresh((value) => value + 1)
       setCheckoutError('')
     } catch (error) {
       setCheckoutError(error instanceof Error ? error.message : 'Không thể xóa sản phẩm khỏi giỏ.')
@@ -556,10 +569,18 @@ export default function App() {
           payment_method: 'cod',
         }),
       })
-      if (!response.ok) throw new Error(await readError(response))
+      if (!response.ok) {
+        const message = await readError(response)
+        if (response.status === 409) {
+          const currentCart = await authorizedFetch('/api/v1/cart')
+          if (currentCart.ok) applyCartSnapshot(await currentCart.json() as Cart)
+        }
+        throw new Error(message)
+      }
       const result = (await response.json()) as { data: Order }
       checkoutKeyRef.current = ''
       setCart(emptyCart)
+      setStockRefresh((value) => value + 1)
       setCheckoutOpen(false)
       setCartOpen(false)
       setSelectedOrder(result.data)
@@ -572,6 +593,18 @@ export default function App() {
     } finally {
       setCheckoutBusy(false)
     }
+  }
+
+  function applyCartSnapshot(nextCart: Cart) {
+    setCart(nextCart)
+    setProductsData((current) => ({
+      ...current,
+      data: current.data.map((product) => {
+        const cartItem = nextCart.items.find((item) => item.product_id === product.id)
+        return cartItem ? { ...product, available_stock: cartItem.stock, reserved_stock: Math.max(0, product.stock - cartItem.stock) } : product
+      }),
+    }))
+    setStockRefresh((value) => value + 1)
   }
 
   async function openOrderDetails(order: Order, admin = false) {
@@ -666,7 +699,7 @@ export default function App() {
           <div className="admin-section-heading product-admin-heading"><h3>Sản phẩm</h3><span>{adminProducts.total} sản phẩm</span></div>
           {adminError && !productEditor && !categoryEditor && <p className="admin-error" role="alert">{adminError}</p>}
           {adminProducts.data.length ? <div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>Sản phẩm</th><th>Danh mục</th><th>Giá</th><th>Tồn kho</th><th>Trạng thái</th><th></th></tr></thead><tbody>
-            {adminProducts.data.map((product) => <tr key={product.id}><td><div className="admin-product-name">{product.image_url ? <img src={product.image_url} alt="" /> : <span>🧺</span>}<strong>{product.name}</strong></div></td><td>{product.category}</td><td>{product.price.toLocaleString('vi-VN')}đ</td><td>{product.stock}</td><td><span className={`product-status ${product.is_active ? 'active' : 'inactive'}`}>{product.is_active ? 'Đang bán' : 'Ẩn'}</span></td><td><div className="admin-row-actions"><button type="button" onClick={() => { setProductEditor(product); setUploadedImage(product.image_url); setImagePreview(product.image_url); setAdminError('') }}>Sửa</button><button className="danger-button" type="button" onClick={() => deleteProduct(product)}>Xóa</button></div></td></tr>)}
+            {adminProducts.data.map((product) => <tr key={product.id}><td><div className="admin-product-name">{product.image_url ? <img src={product.image_url} alt="" /> : <span>🧺</span>}<strong>{product.name}</strong></div></td><td>{product.category}</td><td>{product.price.toLocaleString('vi-VN')}đ</td><td>{product.stock}<small className="table-subtext">Khả dụng {product.available_stock}{product.reserved_stock ? ` · giữ ${product.reserved_stock}` : ''}</small></td><td><span className={`product-status ${product.is_active ? 'active' : 'inactive'}`}>{product.is_active ? 'Đang bán' : 'Ẩn'}</span></td><td><div className="admin-row-actions"><button type="button" onClick={() => { setProductEditor(product); setUploadedImage(product.image_url); setImagePreview(product.image_url); setAdminError('') }}>Sửa</button><button className="danger-button" type="button" onClick={() => deleteProduct(product)}>Xóa</button></div></td></tr>)}
           </tbody></table></div> : <p className="admin-hint">Chưa có sản phẩm phù hợp.</p>}
           <div className="pagination admin-pagination"><button type="button" disabled={adminPage <= 1} onClick={() => setAdminPage((value) => value - 1)}>← Trước</button><span>Trang {adminPage} / {Math.max(1, Math.ceil(adminProducts.total / 8))}</span><button type="button" disabled={adminPage >= Math.ceil(adminProducts.total / 8)} onClick={() => setAdminPage((value) => value + 1)}>Sau →</button></div>
 
@@ -704,7 +737,7 @@ export default function App() {
         {productsLoading ? <p className="empty-catalog">Đang tải sản phẩm...</p> : productsData.data.length ? <div className="product-grid">
           {productsData.data.map((product) => <article className="product-card" key={product.id}>
             <div className="product-art">{product.image_url ? <img src={product.image_url} alt={product.name} /> : <span>🧺</span>}<small>{product.category}</small></div>
-            <div className="product-info"><p>{product.category}</p><h3>{product.name}</h3><p className="product-description">{product.description}</p><div className="product-bottom"><strong>{formatMoney(product.price)}</strong><button className={`cart-add-button${product.stock < 1 ? ' sold-out' : ''}`} type="button" aria-label={product.stock < 1 ? `${product.name} đã hết hàng` : `Thêm ${product.name} vào giỏ hàng`} title={product.stock < 1 ? 'Hết hàng' : 'Thêm vào giỏ hàng'} disabled={product.stock < 1} onClick={() => addCartItem(product)}>{product.stock < 1 ? 'Hết hàng' : <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 3h2l2.4 11.4a2 2 0 0 0 2 1.6h7.9a2 2 0 0 0 1.9-1.5L21 8H6" /><circle cx="10" cy="20" r="1" /><circle cx="18" cy="20" r="1" /><path d="M14 4v6m-3-3h6" /></svg>}</button></div></div>
+            <div className="product-info"><p>{product.category}</p><h3>{product.name}</h3><p className="product-description">{product.description}</p><div className="product-bottom"><div className="product-price-stock"><strong>{formatMoney(product.price)}</strong><span className="stock-label">Còn {product.available_stock} khả dụng</span></div><button className={`cart-add-button${product.available_stock < 1 ? ' sold-out' : ''}`} type="button" aria-label={product.available_stock < 1 ? `${product.name} đã hết hàng` : `Thêm ${product.name} vào giỏ hàng`} title={product.available_stock < 1 ? 'Tạm hết hàng' : 'Thêm vào giỏ hàng'} disabled={product.available_stock < 1} onClick={() => addCartItem(product)}>{product.available_stock < 1 ? 'Hết hàng' : <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 3h2l2.4 11.4a2 2 0 0 0 2 1.6h7.9a2 2 0 0 0 1.9-1.5L21 8H6" /><circle cx="10" cy="20" r="1" /><circle cx="18" cy="20" r="1" /><path d="M14 4v6m-3-3h6" /></svg>}</button></div></div>
           </article>)}
         </div> : <p className="empty-catalog">{searchQuery || categoryFilter ? 'Không tìm thấy sản phẩm phù hợp.' : 'Chưa có sản phẩm nào. Quay lại sau nhé!'}</p>}
         <div className="pagination"><button type="button" disabled={productPage <= 1} onClick={() => setProductPage((value) => value - 1)}>← Trước</button><span>Trang {productPage} / {Math.max(1, Math.ceil(productsData.total / 8))}</span><button type="button" disabled={productPage >= Math.ceil(productsData.total / 8)} onClick={() => setProductPage((value) => value + 1)}>Sau →</button></div>
@@ -726,8 +759,8 @@ export default function App() {
             <p className="eyebrow">GIỎ HÀNG CỦA BẠN</p><h2 id="cart-title">Giỏ hàng <span className="cart-count-label">{cart.item_count} sản phẩm</span></h2>
             {cart.items.length ? <div className="cart-line-list">{cart.items.map((item) => <div className="cart-line" key={item.product_id}>
               {item.image_url ? <img src={item.image_url} alt="" /> : <span className="cart-line-placeholder">🧺</span>}
-              <div className="cart-line-info"><strong>{item.name}</strong><span>{formatMoney(item.price)}</span><small>Còn {item.stock} trong kho</small></div>
-              <div className="quantity-control"><button type="button" aria-label="Giảm số lượng" disabled={item.quantity <= 1} onClick={() => updateCartItem(item.product_id, item.quantity - 1)}>−</button><span>{item.quantity}</span><button type="button" aria-label="Tăng số lượng" disabled={item.quantity >= item.stock} onClick={() => updateCartItem(item.product_id, item.quantity + 1)}>+</button></div>
+              <div className="cart-line-info"><strong>{item.name}</strong><span>{formatMoney(item.price)}</span><small>Đang giữ {item.quantity} · còn {item.stock} khả dụng thêm</small></div>
+              <div className="quantity-control"><button type="button" aria-label="Giảm số lượng" disabled={item.quantity <= 1} onClick={() => updateCartItem(item.product_id, item.quantity - 1)}>−</button><span>{item.quantity}</span><button type="button" aria-label="Tăng số lượng" disabled={item.stock < 1} onClick={() => updateCartItem(item.product_id, item.quantity + 1)}>+</button></div>
               <button className="remove-line" type="button" onClick={() => removeCartItem(item.product_id)}>Xóa</button>
             </div>)}</div> : <p className="empty-catalog cart-empty">Giỏ hàng đang trống. Hãy chọn vài sản phẩm bạn thích nhé.</p>}
             {checkoutError && <p className="auth-error" role="alert">{checkoutError}</p>}

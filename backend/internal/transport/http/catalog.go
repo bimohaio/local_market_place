@@ -33,18 +33,20 @@ type Category struct {
 }
 
 type Product struct {
-	ID          int64     `json:"id"`
-	CategoryID  int64     `json:"category_id"`
-	Category    string    `json:"category"`
-	Name        string    `json:"name"`
-	Slug        string    `json:"slug"`
-	Description string    `json:"description"`
-	Price       float64   `json:"price"`
-	Stock       int       `json:"stock"`
-	ImageURL    string    `json:"image_url"`
-	IsActive    bool      `json:"is_active"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID             int64     `json:"id"`
+	CategoryID     int64     `json:"category_id"`
+	Category       string    `json:"category"`
+	Name           string    `json:"name"`
+	Slug           string    `json:"slug"`
+	Description    string    `json:"description"`
+	Price          float64   `json:"price"`
+	Stock          int       `json:"stock"`
+	ReservedStock  int       `json:"reserved_stock"`
+	AvailableStock int       `json:"available_stock"`
+	ImageURL       string    `json:"image_url"`
+	IsActive       bool      `json:"is_active"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type pageResult[T any] struct {
@@ -74,6 +76,7 @@ func (catalog *Catalog) EnsureSchema() error {
 			description TEXT NOT NULL DEFAULT '',
 			price NUMERIC(12,2) NOT NULL CHECK (price >= 0),
 			stock INTEGER NOT NULL DEFAULT 0 CHECK (stock >= 0),
+			reserved_stock INTEGER NOT NULL DEFAULT 0 CHECK (reserved_stock >= 0 AND reserved_stock <= stock),
 			image_url TEXT NOT NULL DEFAULT '',
 			is_active BOOLEAN NOT NULL DEFAULT TRUE,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -81,6 +84,12 @@ func (catalog *Catalog) EnsureSchema() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS products_category_id_idx ON products(category_id)`,
 		`CREATE INDEX IF NOT EXISTS products_created_at_idx ON products(created_at DESC)`,
+		`ALTER TABLE products ADD COLUMN IF NOT EXISTS reserved_stock INTEGER NOT NULL DEFAULT 0`,
+		`DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'products_reserved_stock_check' AND conrelid = 'products'::regclass) THEN
+				ALTER TABLE products ADD CONSTRAINT products_reserved_stock_check CHECK (reserved_stock >= 0 AND reserved_stock <= stock);
+			END IF;
+		END $$`,
 	}
 	for _, statement := range statements {
 		if _, err := catalog.db.Exec(statement); err != nil {
@@ -301,7 +310,7 @@ func (catalog *Catalog) listProducts(includeInactive bool) gin.HandlerFunc {
 			return
 		}
 		queryArgs := append(append([]any{}, args...), limit, offset)
-		query := `SELECT p.id, p.category_id, c.name, p.name, p.slug, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+		query := `SELECT p.id, p.category_id, c.name, p.name, p.slug, p.description, p.price, p.stock, p.reserved_stock, p.stock - p.reserved_stock, p.image_url, p.is_active, p.created_at, p.updated_at
 			FROM products p JOIN categories c ON c.id = p.category_id WHERE ` + whereSQL +
 			fmt.Sprintf(" ORDER BY %s %s, p.id ASC LIMIT $%d OFFSET $%d", sortColumn, direction, len(args)+1, len(args)+2)
 		rows, err := catalog.db.QueryContext(c.Request.Context(), query, queryArgs...)
@@ -313,7 +322,7 @@ func (catalog *Catalog) listProducts(includeInactive bool) gin.HandlerFunc {
 		products := make([]Product, 0, limit)
 		for rows.Next() {
 			var product Product
-			if err := rows.Scan(&product.ID, &product.CategoryID, &product.Category, &product.Name, &product.Slug, &product.Description, &product.Price, &product.Stock, &product.ImageURL, &product.IsActive, &product.CreatedAt, &product.UpdatedAt); err != nil {
+			if err := rows.Scan(&product.ID, &product.CategoryID, &product.Category, &product.Name, &product.Slug, &product.Description, &product.Price, &product.Stock, &product.ReservedStock, &product.AvailableStock, &product.ImageURL, &product.IsActive, &product.CreatedAt, &product.UpdatedAt); err != nil {
 				internalError(c)
 				return
 			}
@@ -442,16 +451,16 @@ func (catalog *Catalog) saveProduct(c *gin.Context, id int64, input productInput
 	var product Product
 	query := `INSERT INTO products (category_id, name, slug, description, price, stock, image_url, is_active)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		RETURNING id, category_id, name, slug, description, price, stock, image_url, is_active, created_at, updated_at`
+		RETURNING id, category_id, name, slug, description, price, stock, reserved_stock, stock - reserved_stock, image_url, is_active, created_at, updated_at`
 	args := []any{input.CategoryID, input.Name, input.Slug, input.Description, input.Price, input.Stock, input.ImageURL, *input.IsActive}
 	if id > 0 {
 		query = `UPDATE products SET category_id = $1, name = $2, slug = $3, description = $4, price = $5, stock = $6,
 			image_url = $7, is_active = $8, updated_at = NOW() WHERE id = $9
-			RETURNING id, category_id, name, slug, description, price, stock, image_url, is_active, created_at, updated_at`
+			RETURNING id, category_id, name, slug, description, price, stock, reserved_stock, stock - reserved_stock, image_url, is_active, created_at, updated_at`
 		args = append(args, id)
 	}
 	err := catalog.db.QueryRowContext(c.Request.Context(), query, args...).Scan(
-		&product.ID, &product.CategoryID, &product.Name, &product.Slug, &product.Description, &product.Price, &product.Stock, &product.ImageURL, &product.IsActive, &product.CreatedAt, &product.UpdatedAt)
+		&product.ID, &product.CategoryID, &product.Name, &product.Slug, &product.Description, &product.Price, &product.Stock, &product.ReservedStock, &product.AvailableStock, &product.ImageURL, &product.IsActive, &product.CreatedAt, &product.UpdatedAt)
 	if err != nil {
 		return Product{}, err
 	}
@@ -503,13 +512,13 @@ func (catalog *Catalog) removeUnusedImage(imageURL string) {
 
 func (catalog *Catalog) findProduct(c *gin.Context, id int64, includeInactive bool) (Product, error) {
 	var product Product
-	query := `SELECT p.id, p.category_id, c.name, p.name, p.slug, p.description, p.price, p.stock, p.image_url, p.is_active, p.created_at, p.updated_at
+	query := `SELECT p.id, p.category_id, c.name, p.name, p.slug, p.description, p.price, p.stock, p.reserved_stock, p.stock - p.reserved_stock, p.image_url, p.is_active, p.created_at, p.updated_at
 		FROM products p JOIN categories c ON c.id = p.category_id WHERE p.id = $1`
 	if !includeInactive {
 		query += ` AND p.is_active = TRUE`
 	}
 	err := catalog.db.QueryRowContext(c.Request.Context(), query, id).Scan(
-		&product.ID, &product.CategoryID, &product.Category, &product.Name, &product.Slug, &product.Description, &product.Price, &product.Stock, &product.ImageURL, &product.IsActive, &product.CreatedAt, &product.UpdatedAt)
+		&product.ID, &product.CategoryID, &product.Category, &product.Name, &product.Slug, &product.Description, &product.Price, &product.Stock, &product.ReservedStock, &product.AvailableStock, &product.ImageURL, &product.IsActive, &product.CreatedAt, &product.UpdatedAt)
 	return product, err
 }
 

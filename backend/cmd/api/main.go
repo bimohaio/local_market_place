@@ -52,6 +52,7 @@ func main() {
 		log.Fatalf("initialize order schema: %v", err)
 	}
 	orders.RegisterRoutes(router.Group("/api/v1"), auth)
+	go orders.RunReservationCleanup(context.Background())
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,

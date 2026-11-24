@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"strconv"
@@ -17,6 +18,8 @@ import (
 )
 
 type Orders struct{ db *sql.DB }
+
+const cartReservationTTL = 30 * time.Minute
 
 type CartLine struct {
 	ProductID int64   `json:"product_id"`
@@ -75,17 +78,22 @@ func (orders *Orders) EnsureSchema() error {
 		`CREATE TABLE IF NOT EXISTS carts (
 			id BIGSERIAL PRIMARY KEY,
 			user_id BIGINT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+			expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 minutes'),
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
+		`ALTER TABLE carts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 minutes')`,
+		`CREATE INDEX IF NOT EXISTS carts_expires_at_idx ON carts(expires_at)`,
 		`CREATE TABLE IF NOT EXISTS cart_items (
 			cart_id BIGINT NOT NULL REFERENCES carts(id) ON DELETE CASCADE,
 			product_id BIGINT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
 			quantity INTEGER NOT NULL CHECK (quantity > 0),
+			reservation_applied BOOLEAN NOT NULL DEFAULT FALSE,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			PRIMARY KEY (cart_id, product_id)
 		)`,
+		`ALTER TABLE cart_items ADD COLUMN IF NOT EXISTS reservation_applied BOOLEAN NOT NULL DEFAULT FALSE`,
 		`CREATE TABLE IF NOT EXISTS orders (
 			id BIGSERIAL PRIMARY KEY,
 			code VARCHAR(40) NOT NULL UNIQUE,
@@ -157,7 +165,94 @@ func (orders *Orders) EnsureSchema() error {
 			return err
 		}
 	}
-	return nil
+	return orders.migrateUnreservedCartItems(context.Background())
+}
+
+func (orders *Orders) migrateUnreservedCartItems(ctx context.Context) error {
+	tx, err := orders.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT c.id FROM carts c JOIN cart_items ci ON ci.cart_id = c.id
+		WHERE ci.reservation_applied = FALSE ORDER BY c.id`)
+	if err != nil {
+		return err
+	}
+	cartIDs := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		cartIDs = append(cartIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, cartID := range cartIDs {
+		var expiresAt time.Time
+		if err := tx.QueryRowContext(ctx, `SELECT expires_at FROM carts WHERE id = $1 FOR UPDATE`, cartID).Scan(&expiresAt); err != nil {
+			return err
+		}
+		if !expiresAt.After(time.Now()) {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM cart_items WHERE cart_id = $1 AND reservation_applied = FALSE`, cartID); err != nil {
+				return err
+			}
+			continue
+		}
+		items, err := tx.QueryContext(ctx, `SELECT product_id, quantity FROM cart_items WHERE cart_id = $1 AND reservation_applied = FALSE ORDER BY product_id FOR UPDATE`, cartID)
+		if err != nil {
+			return err
+		}
+		type item struct {
+			productID int64
+			quantity  int
+		}
+		cartItems := make([]item, 0)
+		for items.Next() {
+			var current item
+			if err := items.Scan(&current.productID, &current.quantity); err != nil {
+				items.Close()
+				return err
+			}
+			cartItems = append(cartItems, current)
+		}
+		if err := items.Err(); err != nil {
+			items.Close()
+			return err
+		}
+		items.Close()
+		for _, current := range cartItems {
+			var stock, reserved int
+			if err := tx.QueryRowContext(ctx, `SELECT stock, reserved_stock FROM products WHERE id = $1 FOR UPDATE`, current.productID).Scan(&stock, &reserved); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					if _, deleteErr := tx.ExecContext(ctx, `DELETE FROM cart_items WHERE cart_id = $1 AND product_id = $2`, cartID, current.productID); deleteErr != nil {
+						return deleteErr
+					}
+					continue
+				}
+				return err
+			}
+			quantity := min(current.quantity, max(0, stock-reserved))
+			if quantity == 0 {
+				if _, err := tx.ExecContext(ctx, `DELETE FROM cart_items WHERE cart_id = $1 AND product_id = $2`, cartID, current.productID); err != nil {
+					return err
+				}
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE products SET reserved_stock = reserved_stock + $1 WHERE id = $2`, quantity, current.productID); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE cart_items SET quantity = $1, reservation_applied = TRUE, updated_at = NOW() WHERE cart_id = $2 AND product_id = $3`, quantity, cartID, current.productID); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func (orders *Orders) RegisterRoutes(api *gin.RouterGroup, auth *Auth) {
@@ -196,8 +291,12 @@ func (orders *Orders) getCart(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if err := orders.releaseExpiredCart(c.Request.Context(), userID); err != nil {
+		internalError(c)
+		return
+	}
 	rows, err := orders.db.QueryContext(c.Request.Context(), `
-		SELECT p.id, p.name, p.slug, p.image_url, p.price, p.stock, ci.quantity, p.price * ci.quantity
+		SELECT p.id, p.name, p.slug, p.image_url, p.price, p.stock - p.reserved_stock, ci.quantity, p.price * ci.quantity
 		FROM carts ca JOIN cart_items ci ON ci.cart_id = ca.id JOIN products p ON p.id = ci.product_id
 		WHERE ca.user_id = $1 ORDER BY ci.created_at ASC`, userID)
 	if err != nil {
@@ -272,19 +371,22 @@ func (orders *Orders) setCartItem(c *gin.Context) {
 }
 
 func (orders *Orders) changeCartItem(c *gin.Context, userID, productID int64, quantity int, add bool) error {
+	if err := orders.releaseExpiredCart(c.Request.Context(), userID); err != nil {
+		return err
+	}
 	tx, err := orders.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var cartID int64
-	err = tx.QueryRowContext(c.Request.Context(), `INSERT INTO carts (user_id) VALUES ($1) ON CONFLICT (user_id) DO UPDATE SET updated_at = NOW() RETURNING id`, userID).Scan(&cartID)
+	err = tx.QueryRowContext(c.Request.Context(), `INSERT INTO carts (user_id) VALUES ($1) ON CONFLICT (user_id) DO UPDATE SET updated_at = NOW(), expires_at = NOW() + INTERVAL '30 minutes' RETURNING id`, userID).Scan(&cartID)
 	if err != nil {
 		return err
 	}
-	var stock int
+	var available int
 	var active bool
-	err = tx.QueryRowContext(c.Request.Context(), `SELECT stock, is_active FROM products WHERE id = $1 FOR UPDATE`, productID).Scan(&stock, &active)
+	err = tx.QueryRowContext(c.Request.Context(), `SELECT stock - reserved_stock, is_active FROM products WHERE id = $1 FOR UPDATE`, productID).Scan(&available, &active)
 	if err != nil {
 		return err
 	}
@@ -302,11 +404,21 @@ func (orders *Orders) changeCartItem(c *gin.Context, userID, productID int64, qu
 	if add {
 		next += current
 	}
-	if next > stock {
+	if next > 99 || next-current > available {
 		return errInsufficientStock
 	}
-	if _, err = tx.ExecContext(c.Request.Context(), `INSERT INTO cart_items (cart_id, product_id, quantity) VALUES ($1, $2, $3)
-		ON CONFLICT (cart_id, product_id) DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = NOW()`, cartID, productID, next); err != nil {
+	delta := next - current
+	if delta != 0 {
+		result, err := tx.ExecContext(c.Request.Context(), `UPDATE products SET reserved_stock = reserved_stock + $1, updated_at = NOW() WHERE id = $2 AND reserved_stock + $1 >= 0 AND reserved_stock + $1 <= stock`, delta, productID)
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return errInsufficientStock
+		}
+	}
+	if _, err = tx.ExecContext(c.Request.Context(), `INSERT INTO cart_items (cart_id, product_id, quantity, reservation_applied) VALUES ($1, $2, $3, TRUE)
+		ON CONFLICT (cart_id, product_id) DO UPDATE SET quantity = EXCLUDED.quantity, reservation_applied = TRUE, updated_at = NOW()`, cartID, productID, next); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -320,6 +432,10 @@ func (orders *Orders) deleteCartItem(c *gin.Context) {
 	productID, err := strconv.ParseInt(c.Param("product_id"), 10, 64)
 	if err != nil || productID < 1 {
 		badRequest(c, "product_id không hợp lệ")
+		return
+	}
+	if err := orders.releaseExpiredCart(c.Request.Context(), userID); err != nil {
+		internalError(c)
 		return
 	}
 	tx, err := orders.db.BeginTx(c.Request.Context(), nil)
@@ -338,6 +454,19 @@ func (orders *Orders) deleteCartItem(c *gin.Context) {
 		internalError(c)
 		return
 	}
+	var quantity int
+	var reservationApplied bool
+	err = tx.QueryRowContext(c.Request.Context(), `SELECT quantity, reservation_applied FROM cart_items WHERE cart_id = $1 AND product_id = $2`, cartID, productID).Scan(&quantity, &reservationApplied)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		internalError(c)
+		return
+	}
+	if err == nil && reservationApplied {
+		if _, err := tx.ExecContext(c.Request.Context(), `UPDATE products SET reserved_stock = reserved_stock - $1, updated_at = NOW() WHERE id = $2 AND reserved_stock >= $1`, quantity, productID); err != nil {
+			internalError(c)
+			return
+		}
+	}
 	if _, err := tx.ExecContext(c.Request.Context(), `DELETE FROM cart_items WHERE cart_id = $1 AND product_id = $2`, cartID, productID); err != nil {
 		internalError(c)
 		return
@@ -355,6 +484,119 @@ var (
 	errOrderNotFound       = errors.New("order_not_found")
 	errOrderNotCancellable = errors.New("order_not_cancellable")
 )
+
+func (orders *Orders) releaseCartReservations(ctx context.Context, tx *sql.Tx, cartID int64) error {
+	rows, err := tx.QueryContext(ctx, `SELECT product_id, quantity FROM cart_items WHERE cart_id = $1 AND reservation_applied = TRUE ORDER BY product_id`, cartID)
+	if err != nil {
+		return err
+	}
+	type reservation struct {
+		productID int64
+		quantity  int
+	}
+	reservations := make([]reservation, 0)
+	for rows.Next() {
+		var item reservation
+		if err := rows.Scan(&item.productID, &item.quantity); err != nil {
+			rows.Close()
+			return err
+		}
+		reservations = append(reservations, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, item := range reservations {
+		result, err := tx.ExecContext(ctx, `UPDATE products SET reserved_stock = reserved_stock - $1, updated_at = NOW() WHERE id = $2 AND reserved_stock >= $1`, item.quantity, item.productID)
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return fmt.Errorf("reserved stock out of sync for product %d", item.productID)
+		}
+	}
+	_, err = tx.ExecContext(ctx, `DELETE FROM cart_items WHERE cart_id = $1`, cartID)
+	return err
+}
+
+func (orders *Orders) releaseExpiredCart(ctx context.Context, userID int64) error {
+	tx, err := orders.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var cartID int64
+	var expiresAt time.Time
+	err = tx.QueryRowContext(ctx, `SELECT id, expires_at FROM carts WHERE user_id = $1 FOR UPDATE`, userID).Scan(&cartID, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return tx.Commit()
+	}
+	if err != nil {
+		return err
+	}
+	if !expiresAt.After(time.Now()) {
+		if err := orders.releaseCartReservations(ctx, tx, cartID); err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE carts SET expires_at = NOW() + INTERVAL '30 minutes', updated_at = NOW() WHERE id = $1`, cartID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (orders *Orders) RunReservationCleanup(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := orders.CleanupExpiredReservations(ctx); err != nil {
+				log.Printf("release expired cart reservations: %v", err)
+			}
+		}
+	}
+}
+
+func (orders *Orders) CleanupExpiredReservations(ctx context.Context) error {
+	tx, err := orders.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM carts WHERE expires_at <= NOW() ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED`)
+	if err != nil {
+		return err
+	}
+	cartIDs := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		cartIDs = append(cartIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, cartID := range cartIDs {
+		if err := orders.releaseCartReservations(ctx, tx, cartID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE carts SET expires_at = NOW() + INTERVAL '30 minutes', updated_at = NOW() WHERE id = $1`, cartID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
 
 func writeCartError(c *gin.Context, err error) {
 	switch {
@@ -382,6 +624,7 @@ type checkoutItem struct {
 	image     string
 	price     float64
 	stock     int
+	reserved  int
 	quantity  int
 }
 
@@ -424,7 +667,8 @@ func (orders *Orders) checkout(c *gin.Context) {
 	}
 	defer tx.Rollback()
 	var cartID int64
-	err = tx.QueryRowContext(c.Request.Context(), `SELECT id FROM carts WHERE user_id = $1 FOR UPDATE`, userID).Scan(&cartID)
+	var expiresAt time.Time
+	err = tx.QueryRowContext(c.Request.Context(), `SELECT id, expires_at FROM carts WHERE user_id = $1 FOR UPDATE`, userID).Scan(&cartID, &expiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		c.JSON(http.StatusConflict, gin.H{"error": "Giỏ hàng đang trống"})
 		return
@@ -448,7 +692,23 @@ func (orders *Orders) checkout(c *gin.Context) {
 		internalError(c)
 		return
 	}
-	rows, err := tx.QueryContext(c.Request.Context(), `SELECT p.id, p.name, p.slug, p.image_url, p.price, p.stock, p.is_active, ci.quantity
+	if !expiresAt.After(time.Now()) {
+		if err := orders.releaseCartReservations(c.Request.Context(), tx, cartID); err != nil {
+			internalError(c)
+			return
+		}
+		if _, err := tx.ExecContext(c.Request.Context(), `UPDATE carts SET expires_at = NOW() + INTERVAL '30 minutes', updated_at = NOW() WHERE id = $1`, cartID); err != nil {
+			internalError(c)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(c)
+			return
+		}
+		c.JSON(http.StatusConflict, gin.H{"error": "Giỏ hàng đã hết thời gian giữ sản phẩm. Vui lòng thêm sản phẩm lại."})
+		return
+	}
+	rows, err := tx.QueryContext(c.Request.Context(), `SELECT p.id, p.name, p.slug, p.image_url, p.price, p.stock, p.reserved_stock, p.is_active, ci.quantity, ci.reservation_applied
 		FROM cart_items ci JOIN products p ON p.id = ci.product_id WHERE ci.cart_id = $1 ORDER BY p.id FOR UPDATE OF p`, cartID)
 	if err != nil {
 		internalError(c)
@@ -458,7 +718,8 @@ func (orders *Orders) checkout(c *gin.Context) {
 	for rows.Next() {
 		var item checkoutItem
 		var active bool
-		if err := rows.Scan(&item.productID, &item.name, &item.slug, &item.image, &item.price, &item.stock, &active, &item.quantity); err != nil {
+		var reservationApplied bool
+		if err := rows.Scan(&item.productID, &item.name, &item.slug, &item.image, &item.price, &item.stock, &item.reserved, &active, &item.quantity, &reservationApplied); err != nil {
 			rows.Close()
 			internalError(c)
 			return
@@ -468,7 +729,7 @@ func (orders *Orders) checkout(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Sản phẩm %q không còn được bán", item.name)})
 			return
 		}
-		if item.quantity > item.stock {
+		if !reservationApplied || item.quantity > item.stock || item.quantity > item.reserved {
 			rows.Close()
 			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Sản phẩm %q không đủ tồn kho", item.name)})
 			return
@@ -518,8 +779,13 @@ func (orders *Orders) checkout(c *gin.Context) {
 			internalError(c)
 			return
 		}
-		if _, err := tx.ExecContext(c.Request.Context(), `UPDATE products SET stock = stock - $1, updated_at = NOW() WHERE id = $2 AND stock >= $1`, item.quantity, item.productID); err != nil {
+		result, err := tx.ExecContext(c.Request.Context(), `UPDATE products SET stock = stock - $1, reserved_stock = reserved_stock - $1, updated_at = NOW() WHERE id = $2 AND stock >= $1 AND reserved_stock >= $1`, item.quantity, item.productID)
+		if err != nil {
 			internalError(c)
+			return
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			c.JSON(http.StatusConflict, gin.H{"error": "Tồn kho đã thay đổi. Vui lòng kiểm tra lại giỏ hàng."})
 			return
 		}
 		if _, err := tx.ExecContext(c.Request.Context(), `INSERT INTO inventory_movements (product_id, order_id, user_id, quantity_delta, reason) VALUES ($1, $2, $3, $4, 'order')`, item.productID, orderID, userID, -item.quantity); err != nil {
