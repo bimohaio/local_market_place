@@ -82,6 +82,8 @@ type Order = {
   created_at: string
 }
 type OrderPage = { data: Order[]; page: number; limit: number; total: number }
+type ChatConversation = { id: number; owner_id: number; owner_name: string; order_id?: number; product_id?: number; product_name?: string; last_message?: string; last_message_at: string; created_at: string }
+type ChatMessage = { id: number; conversation_id: number; sender_id: number; sender_name: string; body: string; created_at: string }
 
 const SESSION_KEY = 'localmarket.auth'
 const emptyCart: Cart = { items: [], total: 0, item_count: 0 }
@@ -156,6 +158,16 @@ export default function App() {
   const [adminOrderSearch, setAdminOrderSearch] = useState('')
   const [adminOrderSearchInput, setAdminOrderSearchInput] = useState('')
   const [adminOrderReload, setAdminOrderReload] = useState(0)
+  const [chatOpen, setChatOpen] = useState(false)
+  const [chatConversations, setChatConversations] = useState<ChatConversation[]>([])
+  const [chatConversationID, setChatConversationID] = useState<number | null>(null)
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [chatDraft, setChatDraft] = useState('')
+  const [chatError, setChatError] = useState('')
+  const [chatBusy, setChatBusy] = useState(false)
+  const [chatConnected, setChatConnected] = useState(false)
+  const chatListRef = useRef<HTMLDivElement | null>(null)
+  const lastChatMessageID = useRef(0)
 
   useEffect(() => { sessionRef.current = session }, [session])
 
@@ -313,6 +325,56 @@ export default function App() {
       .catch((error) => setOrderError(error instanceof Error ? error.message : 'Không tải được đơn hàng.'))
   }, [adminOpen, adminOrderPageNumber, adminOrderReload, adminOrderSearch, adminOrderStatus, session?.user.role])
 
+  useEffect(() => {
+    if (!chatOpen || !session) return
+    let active = true
+    authorizedFetch('/api/v1/chat/conversations')
+      .then(async (response) => { if (!response.ok) throw new Error(await readError(response)); return response.json() as Promise<{ data: ChatConversation[] }> })
+      .then(({ data }) => { if (!active) return; setChatConversations(data); if (!chatConversationID && data.length) setChatConversationID(data[0].id) })
+      .catch((error) => { if (active) setChatError(error instanceof Error ? error.message : 'Không tải được hội thoại.') })
+    return () => { active = false }
+  }, [chatOpen, session?.user.id, chatConversationID])
+
+  useEffect(() => {
+    if (!chatOpen || !session || !chatConversationID) { setChatMessages([]); setChatConnected(false); return }
+    let active = true
+    let socket: WebSocket | null = null
+    let reconnectTimer = 0
+    authorizedFetch(`/api/v1/chat/conversations/${chatConversationID}/messages`)
+      .then(async (response) => { if (!response.ok) throw new Error(await readError(response)); return response.json() as Promise<{ data: ChatMessage[] }> })
+      .then(({ data }) => { if (active) setChatMessages(data) })
+      .catch((error) => { if (active) setChatError(error instanceof Error ? error.message : 'Không tải được lịch sử tin nhắn.') })
+    const connectRealtime = async () => {
+      try {
+        const response = await authorizedFetch('/api/v1/chat/ticket', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: chatConversationID }) })
+        if (!response.ok) throw new Error(await readError(response))
+        const { ticket } = await response.json() as { ticket: string }
+        if (!active) return
+        const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+        socket = new WebSocket(`${scheme}//${window.location.host}/api/v1/chat/ws?ticket=${encodeURIComponent(ticket)}`)
+        socket.onopen = () => { if (active) setChatConnected(true) }
+        socket.onclose = () => { if (active) { setChatConnected(false); reconnectTimer = window.setTimeout(connectRealtime, 2000) } }
+        socket.onerror = () => { if (active) setChatConnected(false) }
+        socket.onmessage = (event) => {
+          try {
+            const message = JSON.parse(String(event.data)) as ChatMessage
+            if (active) setChatMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message])
+          } catch { /* Ignore malformed events and keep the chat open. */ }
+        }
+      } catch (error) {
+        if (active) { setChatConnected(false); setChatError(error instanceof Error ? error.message : 'Không thể kết nối chat realtime.'); reconnectTimer = window.setTimeout(connectRealtime, 3000) }
+      }
+    }
+    void connectRealtime()
+    return () => { active = false; window.clearTimeout(reconnectTimer); socket?.close() }
+  }, [chatOpen, chatConversationID, session?.user.id])
+
+  useEffect(() => {
+    const latestID = chatMessages.length ? chatMessages[chatMessages.length - 1].id : 0
+    if (latestID !== lastChatMessageID.current && chatListRef.current) chatListRef.current.scrollTop = chatListRef.current.scrollHeight
+    lastChatMessageID.current = latestID
+  }, [chatMessages])
+
   async function submitAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setAuthBusy(true)
@@ -355,6 +417,10 @@ export default function App() {
     saveSession(null)
     sessionRef.current = null
     setSession(null)
+    setChatOpen(false)
+    setChatConversationID(null)
+    setChatConversations([])
+    setChatMessages([])
     setNotice('Bạn đã đăng xuất.')
     window.setTimeout(() => setNotice(''), 4000)
   }
@@ -653,6 +719,59 @@ export default function App() {
     }
   }
 
+  async function startConversation(orderID?: number) {
+    setChatError('')
+    try {
+      const response = await authorizedFetch('/api/v1/chat/conversations', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(orderID ? { order_id: orderID } : {}),
+      })
+      if (!response.ok) throw new Error(await readError(response))
+      const result = await response.json() as { id: number }
+      setChatConversationID(result.id)
+      setChatOpen(true)
+      setSelectedOrder(null)
+      setChatMessages([])
+      setChatConversations((current) => [{ id: result.id, owner_id: session?.user.id ?? 0, owner_name: session?.user.name ?? '', order_id: orderID, last_message_at: new Date().toISOString(), created_at: new Date().toISOString() }, ...current])
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Không thể bắt đầu hội thoại.')
+    }
+  }
+
+  async function sendChatMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!chatConversationID || !chatDraft.trim()) return
+    setChatBusy(true)
+    setChatError('')
+    try {
+      const response = await authorizedFetch(`/api/v1/chat/conversations/${chatConversationID}/messages`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body: chatDraft, client_message_id: crypto.randomUUID() }),
+      })
+      if (!response.ok) throw new Error(await readError(response))
+      const result = await response.json() as { data: ChatMessage }
+      setChatMessages((current) => current.some((message) => message.id === result.data.id) ? current : [...current, result.data])
+      setChatConversations((current) => current.map((item) => item.id === chatConversationID ? { ...item, last_message: result.data.body, last_message_at: result.data.created_at } : item).sort((a, b) => b.last_message_at.localeCompare(a.last_message_at)))
+      setChatDraft('')
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Không gửi được tin nhắn.')
+    } finally {
+      setChatBusy(false)
+    }
+  }
+
+  async function loadOlderChatMessages() {
+    if (!chatConversationID || !chatMessages.length) return
+    try {
+      const response = await authorizedFetch(`/api/v1/chat/conversations/${chatConversationID}/messages?limit=50&before_id=${chatMessages[0].id}`)
+      if (!response.ok) throw new Error(await readError(response))
+      const result = await response.json() as { data: ChatMessage[] }
+      setChatMessages((current) => [...result.data.filter((item) => !current.some((existing) => existing.id === item.id)), ...current])
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Không tải được tin nhắn cũ hơn.')
+    }
+  }
+
   return (
     <main>
       <header className="topbar">
@@ -663,6 +782,7 @@ export default function App() {
             <>
               <span className="account-name">{session.user.name}<small className={`role-badge ${session.user.role}`}>{session.user.role === 'admin' ? 'Admin' : 'User'}</small></span>
               <button className="auth-outline-button" type="button" onClick={() => { setOrdersOpen(true); setOrderError('') }}>Đơn hàng</button>
+              <button className="auth-outline-button" type="button" onClick={() => { setChatOpen(true); setChatError('') }}>Tin nhắn</button>
               {session.user.role === 'admin' && <button className="auth-outline-button" type="button" onClick={() => { setAdminOpen((open) => !open); setAdminError('') }}>{adminOpen ? 'Đóng quản trị' : 'Quản trị'}</button>}
               <button className="auth-outline-button" type="button" onClick={logout}>Đăng xuất</button>
             </>
@@ -815,7 +935,44 @@ export default function App() {
             <div className="cart-total-row"><span>Tổng cộng</span><strong>{formatMoney(selectedOrder.total)}</strong></div>
             {selectedOrder.status_history?.length ? <div className="order-timeline"><strong>Lịch sử trạng thái</strong>{selectedOrder.status_history.map((change, index) => <div key={`${change.created_at}-${index}`}><span className="timeline-dot" /><span>{orderStatusLabel(change.to_status)}<small>{new Date(change.created_at).toLocaleString('vi-VN')}</small></span></div>)}</div> : null}
             {orderError && <p className="auth-error" role="alert">{orderError}</p>}
+            {!selectedOrderAdmin && <button className="auth-submit chat-order-button" type="button" onClick={() => startConversation(selectedOrder.id)}>Liên hệ hỗ trợ về đơn hàng này</button>}
             {!selectedOrderAdmin && selectedOrder.status === 'confirmed' && <button className="danger-wide-button" type="button" onClick={() => cancelOrder(selectedOrder)}>Hủy đơn hàng</button>}
+          </section>
+        </div>
+      )}
+
+      {chatOpen && session && (
+        <div className="auth-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setChatOpen(false) }}>
+          <section className="auth-dialog chat-dialog" role="dialog" aria-modal="true" aria-labelledby="chat-title">
+            <button className="auth-close" type="button" aria-label="Đóng tin nhắn" onClick={() => setChatOpen(false)}>×</button>
+            <p className="eyebrow">HỖ TRỢ KHÁCH HÀNG</p><h2 id="chat-title">Tin nhắn</h2>
+            <div className="chat-layout">
+              <aside className="chat-sidebar">
+                {chatConversations.map((conversation) => <button className={`chat-thread${chatConversationID === conversation.id ? ' active' : ''}`} type="button" key={conversation.id} onClick={() => { setChatConversationID(conversation.id); setChatError('') }}>
+                  <strong>{session.user.role === 'admin' ? conversation.owner_name : conversation.order_id ? `Đơn hàng #${conversation.order_id}` : conversation.product_name || 'Hỗ trợ Local Market'}</strong>
+                  <small>{conversation.last_message || 'Chưa có tin nhắn'}</small>
+                </button>)}
+                {session.user.role !== 'admin' && <button className="auth-outline-button chat-new-button" type="button" onClick={() => startConversation()}>+ Bắt đầu hội thoại</button>}
+                {!chatConversations.length && session.user.role === 'admin' && <p className="chat-empty">Chưa có hội thoại mới.</p>}
+              </aside>
+              <div className="chat-main">
+                {chatConversationID ? <>
+                  <div className="chat-status"><span className={chatConnected ? 'connected' : ''} />{chatConnected ? 'Đang kết nối realtime' : 'Đang đồng bộ lịch sử'}</div>
+                  <div className="chat-message-list" ref={chatListRef}>
+                    {chatMessages.length >= 50 && <button className="chat-older-button" type="button" onClick={loadOlderChatMessages}>Tải tin nhắn cũ hơn</button>}
+                    {chatMessages.map((message) => <div className={`chat-message${message.sender_id === session.user.id ? ' own' : ''}`} key={message.id}>
+                      <small>{message.sender_name} · {new Date(message.created_at).toLocaleString('vi-VN')}</small><p>{message.body}</p>
+                    </div>)}
+                    {!chatMessages.length && <p className="chat-empty">Gửi lời nhắn đầu tiên để bắt đầu trao đổi.</p>}
+                  </div>
+                  <form className="chat-compose" onSubmit={sendChatMessage}>
+                    <input value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} maxLength={4000} placeholder="Nhập tin nhắn..." aria-label="Nội dung tin nhắn" />
+                    <button type="submit" disabled={chatBusy || !chatDraft.trim()}>{chatBusy ? '...' : 'Gửi'}</button>
+                  </form>
+                </> : <div className="chat-no-selection">{session.user.role === 'admin' ? 'Chọn hội thoại để xem và trả lời.' : 'Bắt đầu hội thoại để được hỗ trợ.'}</div>}
+              </div>
+            </div>
+            {chatError && <p className="auth-error chat-error" role="alert">{chatError}</p>}
           </section>
         </div>
       )}

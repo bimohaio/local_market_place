@@ -131,3 +131,22 @@ images, and hide or publish products. Catalog tables are created idempotently wh
 - COD is the only checkout method configured. Payment rows and statuses are recorded; COD is marked
   paid when an admin marks the order delivered. Online providers need merchant credentials and
   verified provider webhooks before they can be enabled.
+
+## Customer support chat
+
+- `POST /api/v1/chat/conversations` starts or reopens a support conversation. Optional
+  `order_id` and `product_id` fields attach the conversation to marketplace context. Buyers may
+  attach only their own orders; admins can view all conversations and reply.
+- `GET /api/v1/chat/conversations` lists the signed-in user's conversations; admins receive the
+  support inbox. `GET /api/v1/chat/conversations/:id/messages` returns the latest 50 messages.
+  Use `before_id` and `limit` (maximum 100) to page backwards through persisted history.
+- `POST /api/v1/chat/conversations/:id/messages` stores a text message (maximum 4,000 characters).
+  `client_message_id` can be supplied to safely retry a send.
+- `POST /api/v1/chat/ticket` returns a short-lived, single-use WebSocket ticket for a conversation.
+  Connect to `/api/v1/chat/ws?ticket=...` to receive new messages. Messages are written to
+  PostgreSQL first; Redis Pub/Sub distributes committed messages to connected API instances.
+  Reconnecting clients should reload history through the REST endpoint.
+
+The frontend exposes a support inbox for admins, a chat entry for signed-in users, and an
+order-specific support action from order details. Chat schema is initialized idempotently at API
+startup.

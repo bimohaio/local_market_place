@@ -53,6 +53,11 @@ func main() {
 	}
 	orders.RegisterRoutes(router.Group("/api/v1"), auth)
 	go orders.RunReservationCleanup(context.Background())
+	chat := httptransport.NewChat(db, rdb)
+	if err := chat.EnsureSchema(); err != nil {
+		log.Fatalf("initialize chat schema: %v", err)
+	}
+	chat.RegisterRoutes(router.Group("/api/v1"), auth)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
